@@ -351,8 +351,9 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             localStorage.setItem(ATTENDEES_STORAGE_KEY, JSON.stringify(allAttendees));
         } catch (e) {
-            console.error("儲存到 localStorage 失敗:", e);
-            openErrorModal("儲存失敗", "無法將簽到進度儲存到瀏覽器。您的簽到資料在重新整理後可能會遺失。");
+            // 改為非阻塞式處理：不要顯示大型錯誤 Modal，僅用 toast 提醒並記錄錯誤
+            console.warn("localStorage 儲存失敗，改為暫存於記憶體 (或無法使用 localStorage):", e);
+            showToast('⚠️ 本地備份無法寫入瀏覽器；簽到仍會同步到雲端。');
         }
     }
 
@@ -457,7 +458,9 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             
             if (allAttendees.length === 0) {
-                openErrorModal("載入失敗", `無法從 Google Sheet 取得資料，也沒有本地備份。<br><br>錯誤訊息: ${e.message}<br><br>請檢查網路連線及 Apps Script 部署狀態。`);
+                // 改為非阻塞式通知（使用 toast），避免在部署環境顯示大型阻塞視窗
+                console.warn('載入資料失敗，且無本地備份：', e);
+                showToast(`⚠️ 載入 Google Sheet 失敗：${e.message}. 請檢查網路/部署。`);
             }
         }
 
