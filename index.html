@@ -489,6 +489,33 @@ document.addEventListener('DOMContentLoaded', () => {
         }, 3000);
     }
 
+    // 正規化可能為秒、毫秒或字串的時間，回傳毫秒（number）或 null
+    function normalizeTimestamp(ts) {
+        if (ts === null || ts === undefined || ts === '') return null;
+        // 如果是字串，先嘗試 parse 為毫秒
+        if (typeof ts === 'string') {
+            const parsed = Date.parse(ts);
+            if (!isNaN(parsed)) return parsed;
+            // 否則嘗試當數字字串處理
+            const asNum = Number(ts);
+            if (!isNaN(asNum)) ts = asNum;
+        }
+        if (typeof ts === 'number') {
+            // 若看起來像秒（小於 1e12），就乘 1000 轉成毫秒
+            return ts < 1e12 ? Math.round(ts * 1000) : Math.round(ts);
+        }
+        return null;
+    }
+    
+    // 輸出固定格式的本地時間字串：YYYY/MM/DD HH:mm:ss，若無時間回傳空字串
+    function formatLocalDateTime(ts) {
+        const ms = normalizeTimestamp(ts);
+        if (!ms) return '';
+        const d = new Date(ms);
+        const pad = (n) => String(n).padStart(2, '0');
+        return `${d.getFullYear()}/${pad(d.getMonth()+1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    }
+    
     // --- MODAL FUNCTIONS (新增 error modal) ---
     function openModal() { modal.classList.remove('opacity-0', 'pointer-events-none'); modalContent.classList.remove('-translate-y-10'); }
     function closeModal() { modal.classList.add('opacity-0', 'pointer-events-none'); modalContent.classList.add('-translate-y-10'); attendeeForm.reset(); editUuidHidden.value = ''; }
@@ -596,7 +623,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         ${p.checkedIn ? `
                             <div class="flex-grow text-left text-green-600">
                                 <p class="font-semibold flex items-center gap-1"><ion-icon name="checkmark-done-outline"></ion-icon>已簽到</p>
-                                <p class="text-xs text-gray-500">${p.checkInTime ? new Date(p.checkInTime).toLocaleString('zh-TW', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : ''}</p>
+                                <p class="text-xs text-gray-500">${formatLocalDateTime(p.checkInTime)}</p>
                             </div>
                             <button class="cancel-btn text-gray-500 p-2 rounded-md hover:bg-red-100 hover:text-red-600" data-uuid="${p.uuid}" title="取消簽到">
                                 <ion-icon name="arrow-undo-outline" class="pointer-events-none"></ion-icon>
@@ -725,15 +752,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function exportToCSV() {
         const headers = ['狀態', '組別', '身份類別', '姓名', '服務單位/部門', '職稱', '報到時間'];
-        const rows = allAttendees.map(p => [
-            p.checkedIn ? '已報到' : '未報到',
-            p.group,
-            p.category,
-            p.name,
-            p.organization,
-            p.title,
-            p.checkInTime ? new Date(p.checkInTime).toLocaleString('zh-TW') : ''
-        ].map(field => `"${String(field).replace(/"/g, '""')}"`).join(','));
+        const rows = allAttendees.map(p => {
+            const timeStr = formatLocalDateTime(p.checkInTime);
+            return [
+                p.checkedIn ? '已報到' : '未報到',
+                p.group,
+                p.category,
+                p.name,
+                p.organization,
+                p.title,
+                timeStr
+            ].map(field => `"${String(field ?? '').replace(/"/g, '""')}"`).join(',');
+        });
 
         const csvContent = "data:text/csv;charset=utf-8,\uFEFF" + [headers.join(','), ...rows].join('\n');
         const encodedUri = encodeURI(csvContent);
