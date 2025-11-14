@@ -349,9 +349,14 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- DATA PERSISTENCE FUNCTIONS ---
     function saveData() {
         try {
-            localStorage.setItem(ATTENDEES_STORAGE_KEY, JSON.stringify(allAttendees));
+            // 先把所有時間欄位正規化為毫秒或 null，再儲存，避免儲存不合法值（如 0 或字串）
+            const toStore = allAttendees.map(a => ({
+                ...a,
+                checkInTime: normalizeTimestamp(a.checkInTime),
+                checkOutTime: normalizeTimestamp(a.checkOutTime)
+            }));
+            localStorage.setItem(ATTENDEES_STORAGE_KEY, JSON.stringify(toStore));
         } catch (e) {
-            // 改為非阻塞式處理：不要顯示大型錯誤 Modal，僅用 toast 提醒並記錄錯誤
             console.warn("localStorage 儲存失敗，改為暫存於記憶體 (或無法使用 localStorage):", e);
             showToast('⚠️ 本地備份無法寫入瀏覽器；簽到仍會同步到雲端。');
         }
@@ -396,39 +401,41 @@ document.addEventListener('DOMContentLoaded', () => {
     async function loadData() {
         try {
             loadingMessage.textContent = "正在從 Google Sheet 載入學員名單...";
-            const response = await fetch(APPS_SCRIPT_URL);
-            if (!response.ok) {
-                throw new Error(`網路回應錯誤: ${response.status} ${response.statusText}`);
+            // 先嘗試讀取本地備份，做為 merge 的基準（避免 reload 覆蓋已簽到時間）
+            let localMap = {};
+            try {
+                const stored = localStorage.getItem(ATTENDEES_STORAGE_KEY);
+                if (stored) {
+                    const parsedLocal = JSON.parse(stored);
+                    parsedLocal.forEach(item => {
+                        if (item && item.uuid) {
+                            // 確保本地時間已正規化為毫秒或 null
+                            localMap[item.uuid] = {
+                                ...item,
+                                checkInTime: normalizeTimestamp(item.checkInTime),
+                                checkOutTime: normalizeTimestamp(item.checkOutTime)
+                            };
+                        }
+                    });
+                }
+            } catch (localErr) {
+                console.warn('讀取本地備份失敗，仍會嘗試載入遠端資料', localErr);
             }
-            const data = await response.json();
+             const response = await fetch(APPS_SCRIPT_URL);
+             if (!response.ok) {
+                 throw new Error(`網路回應錯誤: ${response.status} ${response.statusText}`);
+             }
+             const data = await response.json();
             
-            if (data.error) {
-                throw new Error(`Apps Script 錯誤: ${data.message}`);
-            }
+             if (data.error) {
+                 throw new Error(`Apps Script 錯誤: ${data.message}`);
+             }
 
-            // 檢查新的資料格式 (v6 API 回傳 attendees 陣列)
-            // 在 loadData 內 mapping 時，將 checkInTime/checkOutTime 正規化為 number (ms) 或 null
-            if (data.attendees && Array.isArray(data.attendees)) {
-                allAttendees = data.attendees.map(item => ({
-                    uuid: item.uuid,
-                    group: item.group || '',
-                    name: item.name || '',
-                    category: item.category || '學員',
-                    organization: item.organization || '',
-                    title: item.title || '',
-                    // 正規化時間欄位：若為數字就直接用，若為字串嘗試 Date.parse，否則 null
-                    checkedIn: !!item.checkedIn,
-                    checkInTime: item.checkInTime ? (typeof item.checkInTime === 'number' ? item.checkInTime : (Date.parse(item.checkInTime) || null)) : null,
-                    checkedOut: !!item.checkedOut,
-                    checkOutTime: item.checkOutTime ? (typeof item.checkOutTime === 'number' ? item.checkOutTime : (Date.parse(item.checkOutTime) || null)) : null
-                }));
-                
-                loadingMessage.textContent = `載入完成！共 ${allAttendees.length} 位參與者`;
-                saveData(); // 儲存到本地
-                
-            } else if (Array.isArray(data)) {
-                // 兼容舊格式
-                allAttendees = data.map(item => ({
+             // 檢查新的資料格式 (v6 API 回傳 attendees 陣列)
+             // 在 loadData 內 mapping 時，將 checkInTime/checkOutTime 正規化為 number (ms) 或 null
+             if (data.attendees && Array.isArray(data.attendees)) {
+                // 以遠端名單為基礎，但對於本地已有的簽到時間（checkInTime）不得被覆蓋
+                const remote = data.attendees.map(item => ({
                     uuid: item.uuid || crypto.randomUUID(),
                     group: item.group || '',
                     name: item.name || '',
@@ -436,23 +443,82 @@ document.addEventListener('DOMContentLoaded', () => {
                     organization: item.organization || '',
                     title: item.title || '',
                     checkedIn: !!item.checkedIn,
-                    // 舊格式也正規化
-                    checkInTime: item.checkInTime ? (typeof item.checkInTime === 'number' ? item.checkInTime : (Date.parse(item.checkInTime) || null)) : null
+                    checkInTime: normalizeTimestamp(item.checkInTime),
+                    checkedOut: !!item.checkedOut,
+                    checkOutTime: normalizeTimestamp(item.checkOutTime)
                 }));
-                saveData();
-            } else {
-                throw new Error("從 Google Sheet 載入的資料格式不正確。");
-            }
 
-        } catch (e) {
-            console.error("載入 Google Sheet 資料失敗:", e);
-            loadingMessage.textContent = "載入失敗，嘗試使用本地備份...";
+                // 合併：若 localMap 有有效的 checkInTime，保留 local 的值（表示使用者實際簽到時間不可被遠端覆蓋）
+                const merged = [];
+                const seen = new Set();
+                remote.forEach(r => {
+                    const local = localMap[r.uuid];
+                    if (local && local.checkInTime) {
+                        merged.push({ ...r, checkedIn: true, checkInTime: local.checkInTime });
+                    } else {
+                        merged.push(r);
+                    }
+                    seen.add(r.uuid);
+                });
+                // 把 local-only 的參與者也補回（例如離線新增尚未回傳到遠端）
+                Object.values(localMap).forEach(l => {
+                    if (!seen.has(l.uuid)) {
+                        merged.unshift({ 
+                            uuid: l.uuid, group: l.group||'', name: l.name||'', category: l.category||'學員',
+                            organization: l.organization||'', title: l.title||'', checkedIn: !!l.checkedIn,
+                            checkInTime: l.checkInTime || null, checkedOut: !!l.checkedOut, checkOutTime: l.checkOutTime || null
+                        });
+                    }
+                });
+
+                allAttendees = merged;
+                 
+                 loadingMessage.textContent = `載入完成！共 ${allAttendees.length} 位參與者`;
+                 saveData(); // 儲存到本地
+                
+             } else if (Array.isArray(data)) {
+                 // 兼容舊格式
+                // 舊格式也做相同合併邏輯簡化處理
+                const remote = data.map(item => ({
+                    uuid: item.uuid || crypto.randomUUID(),
+                    group: item.group || '',
+                    name: item.name || '',
+                    category: item.category || '學員',
+                    organization: item.organization || '',
+                    title: item.title || '',
+                    checkedIn: !!item.checkedIn,
+                    checkInTime: normalizeTimestamp(item.checkInTime)
+                }));
+                // 合併 local 優先保留本地簽到時間
+                const merged = remote.map(r => {
+                    const local = localMap[r.uuid];
+                    if (local && local.checkInTime) return { ...r, checkedIn: true, checkInTime: local.checkInTime };
+                    return r;
+                });
+                Object.values(localMap).forEach(l => {
+                    if (!merged.find(m => m.uuid === l.uuid)) merged.unshift(l);
+                });
+                allAttendees = merged;
+                saveData();
+             } else {
+                 throw new Error("從 Google Sheet 載入的資料格式不正確。");
+             }
+
+         } catch (e) {
+             console.error("載入 Google Sheet 資料失敗:", e);
+             loadingMessage.textContent = "載入失敗，嘗試使用本地備份...";
             
-            // 嘗試載入本地備份
+             // 嘗試載入本地備份
             const storedAttendees = localStorage.getItem(ATTENDEES_STORAGE_KEY);
             if (storedAttendees) {
                 try {
-                    allAttendees = JSON.parse(storedAttendees);
+                    // 解析時也確保時間正規化（避免以前有不合法值）
+                    const parsed = JSON.parse(storedAttendees).map(a => ({ 
+                        ...a,
+                        checkInTime: normalizeTimestamp(a.checkInTime),
+                        checkOutTime: normalizeTimestamp(a.checkOutTime)
+                    }));
+                    allAttendees = parsed;
                     loadingMessage.textContent = `使用本地備份，共 ${allAttendees.length} 位參與者（離線模式）`;
                 } catch (parseError) {
                     console.error("解析本地備份失敗:", parseError);
@@ -460,18 +526,18 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             }
             
-            if (allAttendees.length === 0) {
-                // 改為非阻塞式通知（使用 toast），避免在部署環境顯示大型阻塞視窗
-                console.warn('載入資料失敗，且無本地備份：', e);
-                showToast(`⚠️ 載入 Google Sheet 失敗：${e.message}. 請檢查網路/部署。`);
-            }
-        }
+             if (allAttendees.length === 0) {
+                 // 改為非阻塞式通知（使用 toast），避免在部署環境顯示大型阻塞視窗
+                 console.warn('載入資料失敗，且無本地備份：', e);
+                 showToast(`⚠️ 載入 Google Sheet 失敗：${e.message}. 請檢查網路/部署。`);
+             }
+         }
 
-        // 資料載入完成
-        filterAndRender();
-        updateStats();
-        loadingOverlay.classList.add('opacity-0', 'pointer-events-none');
-    }
+         // 資料載入完成
+         filterAndRender();
+         updateStats();
+         loadingOverlay.classList.add('opacity-0', 'pointer-events-none');
+     }
     
     // --- UI/UX HELPER FUNCTIONS ---
     function updateClock() {
@@ -492,17 +558,23 @@ document.addEventListener('DOMContentLoaded', () => {
     // 正規化可能為秒、毫秒或字串的時間，回傳毫秒（number）或 null
     function normalizeTimestamp(ts) {
         if (ts === null || ts === undefined || ts === '') return null;
-        // 如果是字串，先嘗試 parse 為毫秒
+        // 如果是字串，先嘗試 parse 為 milliseconds
         if (typeof ts === 'string') {
             const parsed = Date.parse(ts);
-            if (!isNaN(parsed)) return parsed;
+            if (!isNaN(parsed)) {
+                // Date.parse 可回傳 0（1970-01-01）但通常代表無效，視為 null
+                return parsed > 0 ? parsed : null;
+            }
             // 否則嘗試當數字字串處理
             const asNum = Number(ts);
             if (!isNaN(asNum)) ts = asNum;
         }
         if (typeof ts === 'number') {
-            // 若看起來像秒（小於 1e12），就乘 1000 轉成毫秒
-            return ts < 1e12 ? Math.round(ts * 1000) : Math.round(ts);
+            // 排除 0 或負數（視為無效）
+            if (ts <= 0) return null;
+            // 若看起來像秒（小於 1e12），就乘 1000 轉成毫秒；否則視為已是毫秒
+            const ms = ts < 1e12 ? Math.round(ts * 1000) : Math.round(ts);
+            return ms > 0 ? ms : null;
         }
         return null;
     }
