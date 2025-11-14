@@ -359,15 +359,17 @@ document.addEventListener('DOMContentLoaded', () => {
     // 新增：同步簽到狀態到 Google Sheet
     async function syncCheckInToSheet(uuid, action) {
         try {
+            // 使用 application/x-www-form-urlencoded 避免瀏覽器發送 preflight OPTIONS
+            const params = new URLSearchParams();
+            params.append('uuid', uuid);
+            params.append('action', action);
+
             const response = await fetch(APPS_SCRIPT_URL, {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'
                 },
-                body: JSON.stringify({
-                    uuid: uuid,
-                    action: action // 'checkin' 或 'checkout'
-                })
+                body: params.toString()
             });
 
             if (!response.ok) {
@@ -680,9 +682,13 @@ document.addEventListener('DOMContentLoaded', () => {
             saveData();
             
             showToast(`${person.name} 的簽到狀態已取消`);
-            
-            // 注意：目前 Google Sheet API 沒有提供取消簽到的功能
-            // 如果需要，可以擴展後端 API 來支援這個操作
+
+            // 同步取消簽到到 Google Sheet
+            try {
+                await syncCheckInToSheet(uuid, 'cancel_checkin');
+            } catch (err) {
+                console.error('取消簽到同步失敗', err);
+            }
         });
     }
 
@@ -759,7 +765,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     exportBtn.addEventListener('click', exportToCSV);
 
-    saveBtn.addEventListener('click', () => {
+    saveBtn.addEventListener('click', async () => {
         const uuidToSave = editUuidHidden.value;
         const data = { 
             group: formGroup.value.trim(),
@@ -774,23 +780,76 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
+        // 若為編輯，先更新本地，再送到後端同步
         if (uuidToSave) { 
-            // 編輯
             const index = allAttendees.findIndex(p => p.uuid === uuidToSave); 
             if (index !== -1) { 
                 const existingData = allAttendees[index]; 
                 allAttendees[index] = { ...existingData, ...data }; 
             }
+
+            // 同步編輯到 Google Sheet (後端會以 uuid 定位並更新提供的欄位)
+            try {
+                const params = new URLSearchParams();
+                params.append('uuid', uuidToSave);
+                Object.keys(data).forEach(k => params.append(k, data[k]));
+
+                const resp = await fetch(APPS_SCRIPT_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+                    body: params.toString()
+                });
+                const resJson = await resp.json();
+                if (!resJson.success) {
+                    showToast('⚠️ 已更新本地，但同步到雲端失敗');
+                }
+            } catch (err) {
+                console.error('同步編輯失敗', err);
+                showToast('⚠️ 已更新本地，但同步到雲端失敗');
+            }
+
         } else { 
-            // 新增
-            allAttendees.unshift({ 
-                ...data, 
-                uuid: crypto.randomUUID(), 
-                checkedIn: false, 
-                checkInTime: null 
-            }); 
+            // 新增：先在後端新增列，後端會回傳 uuid
+            try {
+                const params = new URLSearchParams();
+                Object.keys(data).forEach(k => params.append(k, data[k]));
+                params.append('action', '');
+
+                const resp = await fetch(APPS_SCRIPT_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+                    body: params.toString()
+                });
+                const resJson = await resp.json();
+                if (resJson.success) {
+                    const newUuid = resJson.uuid || crypto.randomUUID();
+                    allAttendees.unshift({ 
+                        ...data, 
+                        uuid: newUuid, 
+                        checkedIn: false, 
+                        checkInTime: null 
+                    }); 
+                } else {
+                    allAttendees.unshift({ 
+                        ...data, 
+                        uuid: crypto.randomUUID(), 
+                        checkedIn: false, 
+                        checkInTime: null 
+                    }); 
+                    showToast('⚠️ 無法同步到雲端，已在本地儲存');
+                }
+            } catch (err) {
+                console.error('新增到後端失敗', err);
+                allAttendees.unshift({ 
+                    ...data, 
+                    uuid: crypto.randomUUID(), 
+                    checkedIn: false, 
+                    checkInTime: null 
+                }); 
+                showToast('⚠️ 無法同步到雲端，已在本地儲存');
+            }
         }
-        
+
         closeModal(); 
         filterAndRender(); 
         updateStats(); 
