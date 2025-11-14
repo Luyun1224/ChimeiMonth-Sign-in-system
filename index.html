@@ -293,9 +293,8 @@
 document.addEventListener('DOMContentLoaded', () => {
 
     // --- Google Sheet & Local Storage ---
-    // (已內嵌您的網址)
     const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxfEsIAxWNXP8zynB0aPHXeWVmMVvCPvwolvdYQ9QWMbXnZxMqhOX75R_R0XSuSX-uVpw/exec';
-    const ATTENDEES_STORAGE_KEY = 'aiWorkshopAttendees_v2'; // v2 for new data structure
+    const ATTENDEES_STORAGE_KEY = 'aiWorkshopAttendees_v3'; // v3 for Google Sheet sync
 
     // --- Data source ---
     let allAttendees = []; // 存放所有參與者資料
@@ -357,61 +356,110 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    // 新增：同步簽到狀態到 Google Sheet
+    async function syncCheckInToSheet(uuid, action) {
+        try {
+            const response = await fetch(APPS_SCRIPT_URL, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    uuid: uuid,
+                    action: action // 'checkin' 或 'checkout'
+                })
+            });
+
+            if (!response.ok) {
+                throw new Error(`網路回應錯誤: ${response.status}`);
+            }
+
+            const result = await response.json();
+            
+            if (!result.success) {
+                throw new Error(result.message || '同步失敗');
+            }
+
+            return result;
+
+        } catch (error) {
+            console.error('同步到 Google Sheet 失敗:', error);
+            // 不要阻止本地操作，但要顯示警告
+            showToast(`⚠️ 本地簽到成功，但同步到雲端失敗: ${error.message}`);
+            return { success: false, error: error.message };
+        }
+    }
+
     async function loadData() {
-        const storedAttendees = localStorage.getItem(ATTENDEES_STORAGE_KEY);
-        
-        if (storedAttendees) {
-            try {
-                allAttendees = JSON.parse(storedAttendees);
-                loadingMessage.textContent = "已載入儲存的簽到進度...";
-                // 短暫顯示後再繼續
-                await new Promise(resolve => setTimeout(resolve, 500));
-            } catch (e) {
-                console.error("解析 localStorage 資料失敗:", e);
-                localStorage.removeItem(ATTENDEES_STORAGE_KEY);
-                // 繼續執行下面的 fetch
+        try {
+            loadingMessage.textContent = "正在從 Google Sheet 載入學員名單...";
+            const response = await fetch(APPS_SCRIPT_URL);
+            if (!response.ok) {
+                throw new Error(`網路回應錯誤: ${response.status} ${response.statusText}`);
             }
-        }
+            const data = await response.json();
+            
+            if (data.error) {
+                throw new Error(`Apps Script 錯誤: ${data.message}`);
+            }
 
-        if (allAttendees.length === 0) {
-            try {
-                loadingMessage.textContent = "正在從 Google Sheet 載入學員名單...";
-                const response = await fetch(APPS_SCRIPT_URL);
-                if (!response.ok) {
-                    throw new Error(`網路回應錯誤: ${response.status} ${response.statusText}`);
-                }
-                const data = await response.json();
+            // 檢查新的資料格式 (v6 API 回傳 attendees 陣列)
+            if (data.attendees && Array.isArray(data.attendees)) {
+                allAttendees = data.attendees.map(item => ({
+                    uuid: item.uuid,
+                    group: item.group || '',
+                    name: item.name || '',
+                    category: item.category || '學員',
+                    organization: item.organization || '',
+                    title: item.title || '',
+                    checkedIn: item.checkedIn || false,
+                    checkInTime: item.checkInTime || null,
+                    checkedOut: item.checkedOut || false,
+                    checkOutTime: item.checkOutTime || null
+                }));
                 
-                // 增加 Array.isArray 檢查
-                if (data && Array.isArray(data)) {
-                    // 確保所有從 GS 來的資料都有 uuid (v3: GS 應該要提供了)
-                    allAttendees = data.map(item => ({
-                        uuid: item.uuid || crypto.randomUUID(), // 備用
-                        group: item.group || '',
-                        name: item.name || '',
-                        category: item.category || '學員',
-                        organization: item.organization || '',
-                        title: item.title || '',
-                        checkedIn: item.checkedIn || false,
-                        checkInTime: item.checkInTime || null
-                    }));
-                    saveData(); // 第一次載入後儲存
-                } else if (data && data.error) {
-                    throw new Error(`Apps Script 錯誤: ${data.message}`);
-                } else {
-                    throw new Error("從 Google Sheet 載入的資料格式不正確，並非陣列。");
+                loadingMessage.textContent = `載入完成！共 ${allAttendees.length} 位參與者`;
+                saveData(); // 儲存到本地
+                
+            } else if (Array.isArray(data)) {
+                // 兼容舊格式
+                allAttendees = data.map(item => ({
+                    uuid: item.uuid || crypto.randomUUID(),
+                    group: item.group || '',
+                    name: item.name || '',
+                    category: item.category || '學員',
+                    organization: item.organization || '',
+                    title: item.title || '',
+                    checkedIn: item.checkedIn || false,
+                    checkInTime: item.checkInTime || null
+                }));
+                saveData();
+            } else {
+                throw new Error("從 Google Sheet 載入的資料格式不正確。");
+            }
+
+        } catch (e) {
+            console.error("載入 Google Sheet 資料失敗:", e);
+            loadingMessage.textContent = "載入失敗，嘗試使用本地備份...";
+            
+            // 嘗試載入本地備份
+            const storedAttendees = localStorage.getItem(ATTENDEES_STORAGE_KEY);
+            if (storedAttendees) {
+                try {
+                    allAttendees = JSON.parse(storedAttendees);
+                    loadingMessage.textContent = `使用本地備份，共 ${allAttendees.length} 位參與者（離線模式）`;
+                } catch (parseError) {
+                    console.error("解析本地備份失敗:", parseError);
+                    allAttendees = [];
                 }
-            } catch (e) {
-                console.error("載入 Google Sheet 資料失敗:", e);
-                loadingMessage.textContent = "載入學員名單失敗。";
-                openErrorModal("載入失敗", `無法從 Google Sheet 取得資料。<br><br>錯誤訊息: ${e.message}<br><br>請檢查網路連線及 Apps Script 部署狀態。`);
-                // 即使失敗也隱藏遮罩
-                loadingOverlay.classList.add('opacity-0', 'pointer-events-none');
-                return; // 錯誤時停止後續執行
+            }
+            
+            if (allAttendees.length === 0) {
+                openErrorModal("載入失敗", `無法從 Google Sheet 取得資料，也沒有本地備份。<br><br>錯誤訊息: ${e.message}<br><br>請檢查網路連線及 Apps Script 部署狀態。`);
             }
         }
 
-        // 資料載入成功
+        // 資料載入完成
         filterAndRender();
         updateStats();
         loadingOverlay.classList.add('opacity-0', 'pointer-events-none');
@@ -597,29 +645,44 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    function handleCheckIn(uuid) {
+    async function handleCheckIn(uuid) {
         const person = allAttendees.find(p => p.uuid === uuid);
-        if (person && !person.checkedIn) {
-            person.checkedIn = true;
-            person.checkInTime = new Date().toISOString(); // 使用 ISO 格式
-            openAlertModal(person);
+        if (!person || person.checkedIn) return;
+
+        // 先更新本地狀態
+        person.checkedIn = true;
+        person.checkInTime = new Date().toISOString();
+        
+        // 立即更新 UI
+        filterAndRender();
+        updateStats();
+        saveData();
+        
+        // 顯示成功訊息
+        openAlertModal(person);
+        
+        // 背景同步到 Google Sheet
+        syncCheckInToSheet(uuid, 'checkin');
+    }
+
+    async function handleCancelCheckIn(uuid) {
+        const person = allAttendees.find(p => p.uuid === uuid);
+        if (!person || !person.checkedIn) return;
+        
+        openConfirmModal('取消簽到確認', `您確定要取消【${person.name}】的簽到狀態嗎？`, async () => {
+            // 先更新本地狀態
+            person.checkedIn = false;
+            person.checkInTime = null;
+            
+            // 立即更新 UI
             filterAndRender();
             updateStats();
             saveData();
-        }
-    }
-
-    function handleCancelCheckIn(uuid) {
-        const person = allAttendees.find(p => p.uuid === uuid);
-        if (!person) return;
-        openConfirmModal('取消簽到確認', `您確定要取消【${person.name}】的簽到狀態嗎？`, () => {
-            if (person.checkedIn) { 
-                person.checkedIn = false; 
-                person.checkInTime = null; 
-                filterAndRender(); 
-                updateStats(); 
-                saveData(); 
-            }
+            
+            showToast(`${person.name} 的簽到狀態已取消`);
+            
+            // 注意：目前 Google Sheet API 沒有提供取消簽到的功能
+            // 如果需要，可以擴展後端 API 來支援這個操作
         });
     }
 
