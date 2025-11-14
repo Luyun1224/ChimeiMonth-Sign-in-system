@@ -407,6 +407,7 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             // 檢查新的資料格式 (v6 API 回傳 attendees 陣列)
+            // 在 loadData 內 mapping 時，將 checkInTime/checkOutTime 正規化為 number (ms) 或 null
             if (data.attendees && Array.isArray(data.attendees)) {
                 allAttendees = data.attendees.map(item => ({
                     uuid: item.uuid,
@@ -415,10 +416,11 @@ document.addEventListener('DOMContentLoaded', () => {
                     category: item.category || '學員',
                     organization: item.organization || '',
                     title: item.title || '',
-                    checkedIn: item.checkedIn || false,
-                    checkInTime: item.checkInTime || null,
-                    checkedOut: item.checkedOut || false,
-                    checkOutTime: item.checkOutTime || null
+                    // 正規化時間欄位：若為數字就直接用，若為字串嘗試 Date.parse，否則 null
+                    checkedIn: !!item.checkedIn,
+                    checkInTime: item.checkInTime ? (typeof item.checkInTime === 'number' ? item.checkInTime : (Date.parse(item.checkInTime) || null)) : null,
+                    checkedOut: !!item.checkedOut,
+                    checkOutTime: item.checkOutTime ? (typeof item.checkOutTime === 'number' ? item.checkOutTime : (Date.parse(item.checkOutTime) || null)) : null
                 }));
                 
                 loadingMessage.textContent = `載入完成！共 ${allAttendees.length} 位參與者`;
@@ -433,8 +435,9 @@ document.addEventListener('DOMContentLoaded', () => {
                     category: item.category || '學員',
                     organization: item.organization || '',
                     title: item.title || '',
-                    checkedIn: item.checkedIn || false,
-                    checkInTime: item.checkInTime || null
+                    checkedIn: !!item.checkedIn,
+                    // 舊格式也正規化
+                    checkInTime: item.checkInTime ? (typeof item.checkInTime === 'number' ? item.checkInTime : (Date.parse(item.checkInTime) || null)) : null
                 }));
                 saveData();
             } else {
@@ -654,36 +657,36 @@ document.addEventListener('DOMContentLoaded', () => {
         const person = allAttendees.find(p => p.uuid === uuid);
         if (!person || person.checkedIn) return;
 
-        // 先更新本地狀態
+        // 先更新本地狀態（使用 timestamp 整數，避免字串解析問題）
         person.checkedIn = true;
-        person.checkInTime = new Date().toISOString();
-        
+        person.checkInTime = Date.now(); // <- 改為數字時間戳
+
         // 立即更新 UI
         filterAndRender();
         updateStats();
         saveData();
-        
+
         // 顯示成功訊息
         openAlertModal(person);
-        
-        // 背景同步到 Google Sheet
+
+        // 背景同步到 Google Sheet（後端仍可記錄/轉換）
         syncCheckInToSheet(uuid, 'checkin');
     }
 
     async function handleCancelCheckIn(uuid) {
         const person = allAttendees.find(p => p.uuid === uuid);
         if (!person || !person.checkedIn) return;
-        
+
         openConfirmModal('取消簽到確認', `您確定要取消【${person.name}】的簽到狀態嗎？`, async () => {
-            // 先更新本地狀態
+            // 先更新本地狀態：取消簽到並清空時間（null）
             person.checkedIn = false;
             person.checkInTime = null;
-            
+
             // 立即更新 UI
             filterAndRender();
             updateStats();
             saveData();
-            
+
             showToast(`${person.name} 的簽到狀態已取消`);
 
             // 同步取消簽到到 Google Sheet
